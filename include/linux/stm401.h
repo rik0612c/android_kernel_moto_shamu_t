@@ -19,6 +19,8 @@
 #ifndef __STM401_H__
 #define __STM401_H__
 
+#include <mach/mmi_hall_notifier.h>
+
 /** The following define the IOCTL command values via the ioctl macros */
 #define STM401_IOCTL_BASE		77
 #define STM401_IOCTL_BOOTLOADERMODE	\
@@ -99,18 +101,13 @@
 		_IOW(STM401_IOCTL_BASE, 38, char*)
 #define STM401_IOCTL_SET_POSIX_TIME	\
 		_IOW(STM401_IOCTL_BASE, 39, unsigned long)
-#define STM401_IOCTL_SET_CONTROL_REG	\
-		_IOW(STM401_IOCTL_BASE, 40, char*)
-#define STM401_IOCTL_GET_STATUS_REG	\
-		_IOR(STM401_IOCTL_BASE, 41, char*)
-#define STM401_IOCTL_GET_TOUCH_REG	\
-		_IOR(STM401_IOCTL_BASE, 42, char*)
+/* 40-42 unused */
 #define STM401_IOCTL_SET_ALGO_REQ \
 		_IOR(STM401_IOCTL_BASE, 43, char*)
 #define STM401_IOCTL_GET_ALGO_EVT \
 		_IOR(STM401_IOCTL_BASE, 44, char*)
-#define STM401_IOCTL_GET_AOD_INSTRUMENTATION_REG \
-		_IOR(STM401_IOCTL_BASE, 45, char*)
+#define STM401_IOCTL_ENABLE_BREATHING \
+		_IOW(STM401_IOCTL_BASE, 45, unsigned char)
 #define STM401_IOCTL_WRITE_REG \
 		_IOR(STM401_IOCTL_BASE, 46, char*)
 #define STM401_IOCTL_READ_REG \
@@ -129,6 +126,8 @@
 		_IOR(STM401_IOCTL_BASE, 53, unsigned char)
 #define STM401_IOCTL_SET_LOWPOWER_MODE \
 		_IOW(STM401_IOCTL_BASE, 54, char)
+#define STM401_IOCTL_SET_FLUSH \
+		_IOW(STM401_IOCTL_BASE, 55, int)
 
 #define FW_VERSION_SIZE 12
 #define STM401_CONTROL_REG_SIZE 200
@@ -154,7 +153,7 @@
 #define M_STEP_COUNTER	0x000080
 
 #define M_LIN_ACCEL		0x000100
-#define M_QUATERNION	0x000200
+#define M_QUAT_6AXIS	0x000200
 #define M_GRAVITY		0x000400
 #define M_DISP_ROTATE		0x000800
 #define M_DISP_BRIGHTNESS	0x001000
@@ -164,12 +163,15 @@
 #define M_UNCALIB_GYRO		0x008000
 #define M_UNCALIB_MAG		0x010000
 #define M_IR_OBJECT		0x020000
+#define M_QUAT_9AXIS		0x040000
 
 /* wake sensor status */
 #define M_DOCK			0x000001
 #define M_PROXIMITY		0x000002
 #define M_TOUCH			0x000004
 #define M_COVER			0x000008
+#define M_QUICKPEEK		0x000010
+#define M_LIFT			0x000020
 #define M_HUB_RESET		0x000080
 
 #define M_FLATUP		0x000100
@@ -178,6 +180,7 @@
 #define M_CAMERA_ACT		0x000800
 #define M_NFC			0x001000
 #define M_SIM			0x002000
+#define M_CHOPCHOP		0x004000
 #define M_LOG_MSG		0x008000
 
 #define M_IR_WAKE_GESTURE	0x200000
@@ -231,7 +234,8 @@ enum STM401_data_types {
 	DT_TEMP,
 	DT_ALS,
 	DT_LIN_ACCEL,
-	DT_QUATERNION,
+	DT_QUAT_6AXIS,
+	DT_QUAT_9AXIS,
 	DT_GRAVITY,
 	DT_DISP_ROTATE,
 	DT_DISP_BRIGHT,
@@ -257,6 +261,9 @@ enum STM401_data_types {
 	DT_STEP_DETECTOR,
 	DT_UNCALIB_GYRO,
 	DT_UNCALIB_MAG,
+	DT_CHOPCHOP,
+	DT_FLUSH,
+	DT_LIFT,
 };
 
 enum {
@@ -293,6 +300,13 @@ struct stm_response {
 };
 
 #ifdef __KERNEL__
+#include <linux/fb_quickdraw.h>
+#if defined(CONFIG_FB)
+#include <linux/notifier.h>
+#include <linux/fb.h>
+#endif
+
+#define NAME			     "stm401"
 
 /* STM401 memory map */
 #define ID                              0x00
@@ -300,6 +314,8 @@ struct stm_response {
 #define ERROR_STATUS                    0x02
 #define LOWPOWER_REG                    0x03
 
+#define STM401_PEEKDATA_REG             0x09
+#define STM401_PEEKSTATUS_REG           0x0A
 #define STM401_STATUS_REG               0x0B
 #define STM401_TOUCH_REG                0x0C
 #define STM401_CONTROL_REG              0x0D
@@ -324,7 +340,9 @@ struct stm_response {
 #define IR_STATE                        0x1F
 
 #define MOTION_DUR                      0x20
+#define QUAT_6AXIS_UPDATE_RATE          0x21
 #define ZRMOTION_DUR                    0x22
+#define QUAT_9AXIS_UPDATE_RATE          0x23
 
 #define BYPASS_MODE                     0x24
 #define SLAVE_ADDRESS                   0x25
@@ -357,6 +375,7 @@ struct stm_response {
 #define TEMPERATURE_DATA                0x41
 
 #define GYRO_X                          0x43
+#define QUATERNION_DATA                 0x44
 #define UNCALIB_GYRO_X			0x45
 #define UNCALIB_MAG_X			0x46
 
@@ -370,6 +389,8 @@ struct stm_response {
 #define CAMERA                          0x4C
 #define NFC                             0x4D
 #define SIM                             0x4E
+#define CHOPCHOP                        0x4F
+#define LIFT                            0x51
 
 #define ALGO_CFG_ACCUM_MODALITY         0x5D
 #define ALGO_REQ_ACCUM_MODALITY         0x60
@@ -414,13 +435,36 @@ struct stm_response {
 
 #define STM401_CLIENT_MASK		0xF0
 
+#define STM401_BUSY_STATUS_MASK	0x80
+#define STM401_BUSY_SLEEP_USEC	10000
+#define STM401_BUSY_RESUME_COUNT	14
+#define STM401_BUSY_SUSPEND_COUNT	6
+#define STM401_LATE_SUSPEND_TIMEOUT	400
+
 #define AOD_WAKEUP_REASON_ESD		4
+#define AOD_WAKEUP_REASON_QP_PREPARE		5
+#define AOD_WAKEUP_REASON_QP_DRAW		6
+#define AOD_WAKEUP_REASON_QP_ERASE		7
+#define AOD_WAKEUP_REASON_QP_COMPLETE		8
+
+#define AOD_QP_ACK_BUFFER_ID_MASK	0x3F
+#define AOD_QP_ACK_RCVD			0
+#define AOD_QP_ACK_DONE			1
+#define AOD_QP_ACK_INVALID		2
+#define AOD_QP_ACK_ESD_RECOVERED	3
+
+#define AOD_QP_DRAW_MAX_BUFFER_ID	63
+#define AOD_QP_DRAW_NO_OVERRIDE		0xFFFF
+
+#define AOD_QP_ENABLED_VOTE_KERN		0x01
+#define AOD_QP_ENABLED_VOTE_USER		0x02
+#define AOD_QP_ENABLED_VOTE_MASK		0x03
 
 #define STM401_MAX_GENERIC_DATA		512
 
 #define ESR_SIZE			128
 
-#define STM401_RESET_DELAY		400
+#define STM401_RESET_DELAY		50
 
 #define I2C_RESPONSE_LENGTH		8
 
@@ -463,6 +507,14 @@ struct stm_response {
 #define ORIENT_X	6
 #define ORIENT_Y	8
 #define ORIENT_Z	10
+#define QUAT_6AXIS_A	0
+#define QUAT_6AXIS_B	2
+#define QUAT_6AXIS_C	4
+#define QUAT_6AXIS_W	6
+#define QUAT_9AXIS_A	8
+#define QUAT_9AXIS_B	10
+#define QUAT_9AXIS_C	12
+#define QUAT_9AXIS_W	14
 #define GYRO_RD_X	0
 #define GYRO_RD_Y	2
 #define GYRO_RD_Z	4
@@ -485,11 +537,35 @@ struct stm_response {
 #define STEP64_DATA	6
 #define SIM_DATA	0
 #define STEP_DETECT	0
+#define CHOPCHOP_DATA   0
+#define LIFT_DISTANCE	0
+#define LIFT_ROTATION	4
+#define LIFT_GRAV_DIFF	8
 
 /* The following macros are intended to be called with the stm IRQ handlers */
 /* only and refer to local variables in those functions. */
 #define STM16_TO_HOST(x) ((short) be16_to_cpu(*((u16 *) (stm401_readbuff+(x)))))
 #define STM32_TO_HOST(x) ((short) be32_to_cpu(*((u32 *) (stm401_readbuff+(x)))))
+
+#define STM401_HALL_SOUTH 1
+#define STM401_HALL_NORTH 2
+
+struct stm401_quickpeek_message {
+	u8 message;
+	u8 panel_state;
+	u8 buffer_id;
+	u16 x1;
+	u16 y1;
+	u16 x2;
+	u16 y2;
+	struct list_head list;
+};
+
+struct stm401_aod_enabled_vote {
+	struct mutex vote_lock;
+	unsigned int vote;
+	unsigned int resolved_vote;
+};
 
 struct stm401_platform_data {
 	int (*init)(void);
@@ -502,8 +578,6 @@ struct stm401_platform_data {
 	int gpio_int;
 	int gpio_sh_wake;
 	int gpio_sh_wake_resp;
-	int gpio_mipi_req;
-	int gpio_mipi_busy;
 	unsigned int bslen_pin_active_value;
 	u16 lux_table[LIGHTING_TABLE_SIZE];
 	u8 brightness_table[LIGHTING_TABLE_SIZE];
@@ -542,6 +616,7 @@ struct stm401_data {
 
 	dev_t stm401_dev_num;
 	struct class *stm401_class;
+	struct device *stm401_class_dev;
 	struct cdev as_cdev;
 	struct cdev ms_cdev;
 
@@ -559,14 +634,33 @@ struct stm401_data {
 	int stm401_ms_data_buffer_head;
 	int stm401_ms_data_buffer_tail;
 	wait_queue_head_t stm401_ms_data_wq;
-	bool ap_stm401_handoff_ctrl;
-	bool ap_stm401_handoff_enable;
 
 	struct regulator *regulator_1;
 	struct regulator *regulator_2;
 
+	/* Quick peek data */
+	struct workqueue_struct *quickpeek_work_queue;
+	struct work_struct quickpeek_work;
+	struct wake_lock quickpeek_wakelock;
+	struct list_head quickpeek_command_list;
+	wait_queue_head_t quickpeek_wait_queue;
+	atomic_t qp_enabled;
+	bool quickpeek_occurred;
+	unsigned short qw_irq_status;
+	struct stm401_aod_enabled_vote aod_enabled;
+	bool ignore_wakeable_interrupts;
+	int ignored_interrupts;
+	bool qp_in_progress;
+	bool qp_prepared;
+	struct mutex qp_list_lock;
+
+	bool in_reset_and_init;
 	bool is_suspended;
 	bool pending_wake_work;
+#if defined(CONFIG_FB)
+	struct notifier_block fb_notif;
+#endif
+	struct mmi_hall_data *hall_data;
 };
 
 /* per algo config, request, and event registers */
@@ -583,6 +677,14 @@ struct stm401_algo_requst_t {
 	char size;
 	char data[ALGO_RQST_DATA_SIZE];
 };
+
+int64_t stm401_timestamp_ns(void);
+int stm401_set_rv_6axis_update_rate(
+	struct stm401_data *ps_stm401,
+	const uint8_t newDelay);
+int stm401_set_rv_9axis_update_rate(
+	struct stm401_data *ps_stm401,
+	const uint8_t newDelay);
 
 irqreturn_t stm401_isr(int irq, void *dev);
 void stm401_irq_work_func(struct work_struct *work);
@@ -626,6 +728,25 @@ void stm401_detect_lowpower_mode(unsigned char *cmdbuff);
 int stm401_load_brightness_table(struct stm401_data *ps_stm401,
 	unsigned char *cmdbuff);
 
+int stm401_irq_wake_work_func_display_locked(struct stm401_data *ps_stm401,
+	unsigned short irq_status);
+unsigned short stm401_get_interrupt_status(struct stm401_data *ps_stm401,
+	unsigned char reg, int *err);
+void stm401_quickpeek_work_func(struct work_struct *work);
+void stm401_quickpeek_reset_locked(struct stm401_data *ps_stm401, bool do_ack);
+int stm401_quickpeek_disable_when_idle(struct stm401_data *ps_stm401);
+void stm401_vote_aod_enabled_locked(struct stm401_data *ps_stm401, int voter,
+	bool enable);
+void stm401_store_vote_aod_enabled(struct stm401_data *ps_stm401, int voter,
+	bool enable);
+void stm401_store_vote_aod_enabled_locked(struct stm401_data *ps_stm401,
+	int voter, bool enable);
+int stm401_resolve_aod_enabled_locked(struct stm401_data *ps_stm401);
+int stm401_display_handle_touch_locked(struct stm401_data *ps_stm401);
+int stm401_display_handle_quickpeek_locked(struct stm401_data *ps_stm401,
+	bool releaseWakelock);
+void stm401_quickwakeup_init(struct stm401_data *ps_stm401);
+
 int stm401_boot_flash_erase(void);
 int stm401_get_version(struct stm401_data *ps_stm401);
 int switch_stm401_mode(enum stm_mode mode);
@@ -636,6 +757,8 @@ extern struct stm401_data *stm401_misc_data;
 extern unsigned short stm401_g_acc_delay;
 extern unsigned short stm401_g_mag_delay;
 extern unsigned short stm401_g_gyro_delay;
+extern uint8_t stm401_g_rv_6axis_delay;
+extern uint8_t stm401_g_rv_9axis_delay;
 extern unsigned short stm401_g_baro_delay;
 extern unsigned short stm401_g_ir_gesture_delay;
 extern unsigned short stm401_g_ir_raw_delay;
