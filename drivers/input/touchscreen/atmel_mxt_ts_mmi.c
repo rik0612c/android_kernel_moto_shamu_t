@@ -30,6 +30,7 @@
 #include <linux/pinctrl/consumer.h>
 #include <linux/semaphore.h>
 #include <linux/atomic.h>
+#include <mach/mmi_hall_notifier.h>
 
 enum {
 	STATE_UNKNOWN,
@@ -48,6 +49,11 @@ enum {
 #ifdef CONFIG_OF
 #include <linux/of.h>
 #include <linux/of_gpio.h>
+#endif
+
+#ifdef CONFIG_MMI_HALL_NOTIFICATIONS
+static int folio_notifier_callback(struct notifier_block *self,
+				 unsigned long event, void *data);
 #endif
 
 #ifdef CONFIG_FB
@@ -332,6 +338,9 @@ struct mxt_data {
 	struct mxt_patchset *alternate_mode;
 	struct mxt_patchset *current_mode;
 
+#ifdef CONFIG_MMI_HALL_NOTIFICATIONS
+	struct notifier_block folio_notif;
+#endif
 	bool irq_enabled;
 	struct regulator *reg_vdd;
 	struct regulator *reg_avdd;
@@ -4890,6 +4899,17 @@ static int mxt_probe(struct i2c_client *client,
 	data->mem_access_created = true;
 	data->mode_is_persistent = true;
 
+#ifdef CONFIG_MMI_HALL_NOTIFICATIONS
+	/* register notifier at the end of probe to */
+	/* avoid unnecessary reset in STANDBY state */
+	data->folio_notif.notifier_call = folio_notifier_callback;
+	dev_dbg(&client->dev, "registering folio notifier\n");
+	error = mmi_hall_register_notifier(&data->folio_notif,
+				MMI_HALL_FOLIO, true);
+	if (error)
+		dev_err(&client->dev, "Error registering folio_notifier: %d\n",
+			error);
+#endif
 	return 0;
 
 err_remove_sysfs_group:
@@ -4978,11 +4998,62 @@ static int mxt_resume(struct device *dev)
 	else
 		state = STATE_ACTIVE;
 
-	data->poweron = true;
 	mxt_set_sensor_state(data, state);
+	data->poweron = true;
 
 	return 0;
 }
+
+#ifdef CONFIG_MMI_HALL_NOTIFICATIONS
+static int folio_notifier_callback(struct notifier_block *self,
+				 unsigned long event, void *data)
+{
+	int state, folio_state = *(int *)data;
+	struct mxt_data *mxt_dev_data =
+		container_of(self, struct mxt_data, folio_notif);
+
+	if (data && event == MMI_HALL_FOLIO &&
+			mxt_dev_data && mxt_dev_data->client) {
+
+		state = mxt_get_sensor_state(mxt_dev_data);
+		dev_dbg(&mxt_dev_data->client->dev,
+			"state: %s(%d), suspend flag: %d, BL flag: %d\n",
+			mxt_state_name(state), state,
+			atomic_read(&mxt_dev_data->suspended),
+			mxt_dev_data->in_bootloader);
+		if (folio_state)
+			/* close */
+			mxt_set_alternate_mode(mxt_dev_data,
+				mxt_dev_data->alternate_mode, false, true);
+		else	/* open */
+			mxt_restore_default_mode(mxt_dev_data);
+
+		dev_dbg(&mxt_dev_data->client->dev, "folio: %s\n",
+			folio_state ? "CLOSED" : "OPENED");
+
+		if (!(state & STATE_UI)) {
+			dev_dbg(&mxt_dev_data->client->dev, "Not in UI\n");
+			goto done;
+		}
+
+		if (!mxt_dev_data->in_bootloader) {
+			if (state == STATE_ACTIVE) {
+				mxt_hw_reset(mxt_dev_data);
+				dev_dbg(&mxt_dev_data->client->dev, "RESET\n");
+			}
+
+			mxt_sensor_state_config(mxt_dev_data,
+					(state == STATE_SUSPEND) ?
+					SUSPEND_IDX : ACTIVE_IDX);
+			dev_dbg(&mxt_dev_data->client->dev,
+					"folio: state change in %s\n",
+					mxt_state_name(state));
+		}
+	}
+done:
+	return 0;
+}
+#endif
 
 #ifdef CONFIG_FB
 static void mxt_queued_resume(struct work_struct *w)
