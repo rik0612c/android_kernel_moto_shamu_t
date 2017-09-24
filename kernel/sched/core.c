@@ -90,6 +90,7 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/sched.h>
 
+
 static atomic_t __su_instances;
 
 int su_instances(void)
@@ -121,6 +122,10 @@ void su_exit(void)
 {
 	atomic_dec(&__su_instances);
 }
+
+const char *task_event_names[] = {"PUT_PREV_TASK", "PICK_NEXT_TASK",
+				  "TASK_WAKE", "TASK_MIGRATE", "TASK_UPDATE",
+				"IRQ_UPDATE"};
 
 ATOMIC_NOTIFIER_HEAD(migration_notifier_head);
 
