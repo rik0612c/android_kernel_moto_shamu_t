@@ -360,12 +360,12 @@ struct net_info {
 };
 
 /* association inform */
-#define MAX_REQ_LINE 1024
+#define MAX_REQ_LINE 1024u
 struct wl_connect_info {
 	u8 req_ie[MAX_REQ_LINE];
-	s32 req_ie_len;
+	u32 req_ie_len;
 	u8 resp_ie[MAX_REQ_LINE];
-	s32 resp_ie_len;
+	u32 resp_ie_len;
 };
 
 /* firmware /nvram downloading controller */
@@ -488,6 +488,7 @@ struct bcm_cfg80211 {
 	struct list_head net_list;     /* used for struct net_info */
 	spinlock_t eq_lock;	/* for event queue synchronization */
 	spinlock_t cfgdrv_lock;	/* to protect scan status (and others if needed) */
+	spinlock_t cfgp2p_lock;	/* used for p2p interface sync */
 	struct completion act_frm_scan;
 	struct completion iface_disable;
 	struct completion wait_next_af;

@@ -188,7 +188,6 @@ struct msm_hs_rx {
 	dma_addr_t rbuffer;
 	unsigned char *buffer;
 	unsigned int buffer_pending;
-	char wl_name[32];
 	struct wake_lock wake_lock;
 	struct delayed_work flip_insert_work;
 	struct tasklet_struct tlet;
@@ -228,7 +227,6 @@ struct msm_hs_port {
 	enum msm_hs_clk_req_off_state_e clk_req_off_state;
 	atomic_t clk_count;
 	struct msm_hs_wakeup wakeup;
-	char dma_wl_name[32];
 	struct wake_lock dma_wake_lock;  /* held while any DMA active */
 
 	struct dentry *loopback_dir;
@@ -258,11 +256,14 @@ struct msm_hs_port {
 	struct pinctrl_state *gpio_state_active;
 	struct pinctrl_state *gpio_state_suspend;
 	bool flow_control;
+	bool obs;
+	wake_peer_fn wake_peer;
+	bool tx_pending;
 };
 
 static struct of_device_id msm_hs_match_table[] = {
-	{ .compatible = "qcom,msm-hsuart-v14",
-	},
+	{ .compatible = "qcom,msm-hsuart-v14"},
+	{}
 };
 
 
@@ -999,6 +1000,7 @@ static void msm_hs_enable_flow_control(struct uart_port *uport)
 	struct msm_hs_port *msm_uport = UARTDM_TO_MSM(uport);
 	unsigned int data;
 
+	MSM_HS_DBG("%s\n", __func__);
 	if (msm_uport->flow_control) {
 		/* Enable RFR line */
 		msm_hs_write(uport, UART_DM_CR, RFR_LOW);
@@ -1021,6 +1023,7 @@ static void msm_hs_disable_flow_control(struct uart_port *uport)
 	 * data while we change the parameters
 	 */
 
+	MSM_HS_DBG("%s\n", __func__);
 	if (msm_uport->flow_control) {
 		data = msm_hs_read(uport, UART_DM_MR1);
 		/* disable auto ready-for-receiving */
@@ -1510,6 +1513,7 @@ static void flip_insert_work(struct work_struct *work)
 	spin_lock_irqsave(&msm_uport->uport.lock, flags);
 	if (msm_uport->rx.buffer_pending == NONE_PENDING) {
 		MSM_HS_ERR("Error: No buffer pending in %s", __func__);
+		spin_unlock_irqrestore(&msm_uport->uport.lock, flags);
 		return;
 	}
 	if (msm_uport->rx.buffer_pending & FIFO_OVERRUN) {
@@ -1735,9 +1739,12 @@ static void msm_hs_start_tx_locked(struct uart_port *uport )
 	struct msm_hs_port *msm_uport = UARTDM_TO_MSM(uport);
 
 	if (msm_uport->clk_state != MSM_HS_CLK_ON) {
-		MSM_HS_WARN("%s: Failed.Clocks are OFF\n", __func__);
+		msm_uport->tx_pending = true;
+		MSM_HS_DBG("%s: Clock not on; tx pending clock on\n", __func__);
 		return;
 	}
+
+	msm_uport->tx_pending = false;
 	if ((msm_uport->tx.tx_ready_int_en == 0) &&
 		(msm_uport->tx.dma_in_flight == 0))
 			msm_hs_submit_tx_locked(uport);
@@ -1875,6 +1882,20 @@ static void msm_hs_sps_rx_callback(struct sps_event_notify *notify)
 		tasklet_schedule(&msm_uport->rx.tlet);
 		MSM_HS_DBG("%s(): Scheduled rx_tlet", __func__);
 	}
+}
+
+void msm_hs_set_wake_peer(struct uart_port *uport, wake_peer_fn wake_peer)
+{
+	struct msm_hs_port *msm_uport = UARTDM_TO_MSM(uport);
+	msm_uport->wake_peer = wake_peer;
+}
+
+static void msm_hs_wake_peer(struct uart_port *uport)
+{
+	struct msm_hs_port *msm_uport = UARTDM_TO_MSM(uport);
+
+	if (msm_uport->wake_peer)
+		msm_uport->wake_peer(uport);
 }
 
 /*
@@ -2030,11 +2051,39 @@ static int msm_hs_check_clock_off(struct uart_port *uport)
 	    msm_uport->imr_reg & UARTDM_ISR_TXLEV_BMSK) {
 		if (msm_uport->clk_state == MSM_HS_CLK_REQUEST_OFF) {
 			msm_uport->clk_state = MSM_HS_CLK_ON;
-			/*
-			 * Enable flow control that
-			 * we disabled in request clock off
-			 */
-			msm_hs_enable_flow_control(uport);
+			if (!msm_uport->obs) {
+				/*
+				 * Enable flow control that
+				 * we disabled in request clock off
+				 */
+				msm_hs_enable_flow_control(uport);
+			}
+		}
+		/***************************************************
+		 a)sps connection can be closed in msm_hs_check_clock_off(the first
+		   time invoked).
+		 b)msm_hs_check_clock_off return 0 after send a clk_off_timer msg to
+		   close sps connection
+		 c)when clk_off_timer is timeout, hsuart_clock_off_work will be
+		   invoked, so msm_hs_check_clock_off is invoked for the second time
+		 d)if there is a data/command comes from stack now, uart circular buf
+		   won't be empty, that meas uart_circ_empty(tx_buf) will return false
+		 e)if uart_circ_empty(tx_buf) return fasle, msm_hs_check_clock_off only
+		   set msm_uport->clk_state to MSM_HS_CLK_ON. but the sps connection
+		   will not be opened any more.
+		 f)now if there a data/command from stack  again
+		   because the sps connection is still close, so the uart can't
+		   thansfer the command/data any more.
+		 so here open sps connection again
+		***************************************************/
+		MSM_HS_DBG("%s check whether need to reopen sps %d\n", __func__,
+				msm_uport->rx.flush);
+		if (msm_uport->rx.flush == FLUSH_SHUTDOWN) {
+			spin_unlock_irqrestore(&uport->lock, flags);
+			msm_hs_spsconnect_rx(uport);
+			spin_lock_irqsave(&uport->lock, flags);
+			MSM_HS_WARN("%s reopen spsconnect.\n", __func__);
+			msm_hs_start_rx_locked(uport);
 		}
 		spin_unlock_irqrestore(&uport->lock, flags);
 		mutex_unlock(&msm_uport->clk_mutex);
@@ -2066,7 +2115,7 @@ static int msm_hs_check_clock_off(struct uart_port *uport)
 
 	spin_unlock_irqrestore(&uport->lock, flags);
 
-	if (use_low_power_wakeup(msm_uport))
+	if (!msm_uport->obs)
 		msm_hs_enable_flow_control(uport);
 
 	/* we really want to clock off */
@@ -2075,18 +2124,20 @@ static int msm_hs_check_clock_off(struct uart_port *uport)
 	mutex_lock(&msm_uport->clk_mutex);
 
 	spin_lock_irqsave(&uport->lock, flags);
-	if (use_low_power_wakeup(msm_uport)) {
+
+	/* For out of band sleep wakeup interrupt is not required */
+	if (!msm_uport->obs && use_low_power_wakeup(msm_uport)) {
 		msm_uport->wakeup.ignore = 1;
 		enable_irq(msm_uport->wakeup.irq);
-		/*
-		 * keeping uport-irq enabled all the time
-		 * gates XO shutdown in idle power collapse. Disable
-		 * this only when wakeup irq is set.
-		 */
-		disable_irq(uport->irq);
 	}
-	wake_unlock(&msm_uport->dma_wake_lock);
 
+	/*
+	 * keeping uport-irq enabled all the time
+	 * gates XO shutdown in idle power collapse.
+	 */
+	disable_irq(uport->irq);
+
+	wake_unlock(&msm_uport->dma_wake_lock);
 	spin_unlock_irqrestore(&uport->lock, flags);
 
 	mutex_unlock(&msm_uport->clk_mutex);
@@ -2246,7 +2297,9 @@ void msm_hs_request_clock_off(struct uart_port *uport) {
 	if (msm_uport->clk_state == MSM_HS_CLK_ON) {
 		msm_uport->clk_state = MSM_HS_CLK_REQUEST_OFF;
 
-		msm_hs_disable_flow_control(uport);
+		/* No need to disable flow control lines in OBS */
+		if (!msm_uport->obs)
+			msm_hs_disable_flow_control(uport);
 		data = msm_hs_read(uport, UART_DM_SR);
 		MSM_HS_DBG("%s(): TXEMT, queuing clock off work\n",
 			__func__);
@@ -2279,17 +2332,18 @@ void msm_hs_request_clock_on(struct uart_port *uport)
 
 	if (cur_clk_state == MSM_HS_CLK_REQUEST_OFF) {
 		msm_uport->clk_state = MSM_HS_CLK_ON;
-		msm_hs_enable_flow_control(uport);
+		if (!msm_uport->obs)
+			msm_hs_enable_flow_control(uport);
 	}
 
 	switch (cur_clk_state) {
 	case MSM_HS_CLK_OFF:
 		wake_lock(&msm_uport->dma_wake_lock);
-		if (use_low_power_wakeup(msm_uport)) {
+		if (!msm_uport->obs && use_low_power_wakeup(msm_uport))
 			disable_irq_nosync(msm_uport->wakeup.irq);
-			/* uport-irq was disabled when clocked off */
-			enable_irq(uport->irq);
-		}
+		/* uport-irq was disabled when clocked off */
+		enable_irq(uport->irq);
+
 		spin_unlock_irqrestore(&uport->lock, flags);
 		mutex_unlock(&msm_uport->clk_mutex);
 		ret = msm_hs_clock_vote(msm_uport);
@@ -2520,10 +2574,10 @@ static void msm_hs_get_pinctrl_configs(struct uart_port *uport)
 		msm_uport->use_pinctrl = true;
 
 		set_state = pinctrl_lookup_state(msm_uport->pinctrl,
-						"hsuart_active");
+						PINCTRL_STATE_DEFAULT);
 		if (IS_ERR_OR_NULL(set_state)) {
 			dev_err(uport->dev,
-				"pinctrl lookup failed for hsuart_active");
+				"pinctrl lookup failed for default state");
 			goto pinctrl_fail;
 		}
 
@@ -2532,10 +2586,10 @@ static void msm_hs_get_pinctrl_configs(struct uart_port *uport)
 		msm_uport->gpio_state_active = set_state;
 
 		set_state = pinctrl_lookup_state(msm_uport->pinctrl,
-						"hsuart_sleep");
+						PINCTRL_STATE_SLEEP);
 		if (IS_ERR_OR_NULL(set_state)) {
 			dev_err(uport->dev,
-				"pinctrl lookup failed for hsuart_sleep");
+				"pinctrl lookup failed for sleep state");
 			goto pinctrl_fail;
 		}
 
@@ -2724,15 +2778,9 @@ static int uartdm_init_port(struct uart_port *uport)
 	init_waitqueue_head(&rx->wait);
 	init_waitqueue_head(&tx->wait);
 	init_waitqueue_head(&msm_uport->bam_disconnect_wait);
-
-	snprintf(rx->wl_name, sizeof(rx->wl_name), "msm_serial_hs_rx-%u",
-		uport->irq);
-	wake_lock_init(&rx->wake_lock, WAKE_LOCK_SUSPEND, rx->wl_name);
-
-	snprintf(msm_uport->dma_wl_name, sizeof(msm_uport->dma_wl_name),
-		"msm_serial_hs_dma-%u", uport->irq);
+	wake_lock_init(&rx->wake_lock, WAKE_LOCK_SUSPEND, "msm_serial_hs_rx");
 	wake_lock_init(&msm_uport->dma_wake_lock, WAKE_LOCK_SUSPEND,
-		msm_uport->dma_wl_name);
+		       "msm_serial_hs_dma");
 
 	tasklet_init(&rx->tlet, msm_serial_hs_rx_tlet,
 			(unsigned long) &rx->tlet);
@@ -2805,6 +2853,11 @@ struct msm_serial_hs_platform_data
 
 	pdata->no_suspend_delay = of_property_read_bool(node,
 				"qcom,no-suspend-delay");
+
+	pdata->obs = of_property_read_bool(node,
+					"qcom,msm-obs");
+	if (pdata->obs)
+		MSM_HS_DBG("%s:Out of Band Sleep is enabled\n", __func__);
 
 	pdata->inject_rx_on_wakeup = of_property_read_bool(node,
 				"qcom,inject-rx-on-wakeup");
@@ -3212,6 +3265,7 @@ static int msm_hs_probe(struct platform_device *pdev)
 		msm_uport->wakeup.ignore = 1;
 		msm_uport->wakeup.inject_rx = pdata->inject_rx_on_wakeup;
 		msm_uport->wakeup.rx_to_inject = pdata->rx_to_inject;
+		msm_uport->obs = pdata->obs;
 
 		msm_uport->bam_tx_ep_pipe_index =
 				pdata->bam_tx_ep_pipe_index;
@@ -3502,11 +3556,14 @@ static int msm_hs_runtime_resume(struct device *dev)
 						    platform_device, dev);
 	struct msm_hs_port *msm_uport = get_matching_hs_port(pdev);
 	int ret;
+	unsigned long flags;
 
+	MSM_HS_DBG("%s\n", __func__);
 	/* This check should not fail
 	 * During probe, we set uport->line to either pdev->id or userid */
 	if (msm_uport) {
 		msm_hs_request_clock_on(&msm_uport->uport);
+		msm_hs_set_mctrl(&msm_uport->uport, TIOCM_RTS);
 		if (msm_uport->use_pinctrl) {
 			ret = pinctrl_select_state(msm_uport->pinctrl,
 						msm_uport->gpio_state_active);
@@ -3514,6 +3571,15 @@ static int msm_hs_runtime_resume(struct device *dev)
 				MSM_HS_ERR("%s(): error select active state",
 					__func__);
 		}
+
+		msm_hs_clock_vote(msm_uport);
+		spin_lock_irqsave(&msm_uport->uport.lock, flags);
+		if (msm_uport->tx_pending) {
+			MSM_HS_DBG("%s sending pending tx\n", __func__);
+			msm_hs_start_tx_locked(&msm_uport->uport);
+		}
+		spin_unlock_irqrestore(&msm_uport->uport.lock, flags);
+		msm_hs_clock_unvote(msm_uport);
 	}
 	return 0;
 }
@@ -3525,9 +3591,11 @@ static int msm_hs_runtime_suspend(struct device *dev)
 	struct msm_hs_port *msm_uport = get_matching_hs_port(pdev);
 	int ret;
 
+	MSM_HS_DBG("%s\n", __func__);
 	/* This check should not fail
 	 * During probe, we set uport->line to either pdev->id or userid */
 	if (msm_uport) {
+		msm_hs_set_mctrl(&msm_uport->uport, 0);
 		msm_hs_request_clock_off(&msm_uport->uport);
 		if (msm_uport->use_pinctrl) {
 			ret = pinctrl_select_state(msm_uport->pinctrl,
@@ -3581,6 +3649,7 @@ static struct uart_ops msm_hs_ops = {
 	.config_port = msm_hs_config_port,
 	.flush_buffer = NULL,
 	.ioctl = msm_hs_ioctl,
+	.wake_peer = msm_hs_wake_peer,
 };
 
 module_init(msm_serial_hs_init);
